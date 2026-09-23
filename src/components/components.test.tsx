@@ -8,6 +8,7 @@ import { App } from '../App';
 import { type CalibrationPlan, createDefaultPlan, matrixToNested } from '../solver/plan';
 import { solveTopRoutes } from '../solver/tsp';
 import { makeRng, randomMatrix } from '../solver/brute';
+import { loadPlan, savePlan } from '../state/storage';
 
 function planWith(n: number, edge = 1): CalibrationPlan {
   const p = createDefaultPlan(n);
@@ -15,6 +16,23 @@ function planWith(n: number, edge = 1): CalibrationPlan {
     for (let i = 0; i < p.matrixFlat.length; i++) p.matrixFlat[i] = p.matrixFlat[i] === 0 ? 0 : edge;
   }
   return p;
+}
+
+/**
+ * 候选行的完整路线以 RouteLine 渲染：“0 停放 → <首姿态> → … → 0 停放”。
+ * 判断首个非停放姿态节点是否为 expectedPose。
+ */
+function sequenceTextStartsWith(row: HTMLElement, expectedPose: number): boolean {
+  const line = row.querySelector('.route-line');
+  const text = line?.textContent ?? '';
+  const m = text.match(/0\s*停放\s*→\s*(\d+)/);
+  return m !== null && Number(m[1]) === expectedPose;
+}
+
+/** 候选行完整路线是否包含按顺序的节点文本 a → b。 */
+function routeContains(row: HTMLElement, a: number, b: number): boolean {
+  const text = row.querySelector('.route-line')?.textContent ?? '';
+  return text.includes(`${a}`) && text.includes(`${b}`);
 }
 
 describe('MatrixEditor 组件', () => {
@@ -204,6 +222,161 @@ describe('ExecutionConsole 组件', () => {
     fireEvent.click(screen.getByRole('button', { name: /返回停放位/ }));
     expect(screen.getByText('已回到停放位 0，结案')).toBeTruthy();
     expect(screen.getByText(/0（与基线一致）/)).toBeTruthy();
+  });
+});
+
+describe('“先于”关系页面行为：临时改依赖、执行拒绝、重算后路线/进度同步', () => {
+  beforeEach(() => localStorage.clear());
+
+  it('依赖草稿与已应用计划分离：未点应用前候选仍是无约束结果，应用后候选满足关系', () => {
+    render(<App />);
+    // 默认 N=12 等费：无约束首名为 1..12（路线节点文本无空格：“1→2→3”）
+    expect(routeContains(screen.getByTestId('candidate-row-1'), 1, 2)).toBe(true);
+    expect(sequenceTextStartsWith(screen.getByTestId('candidate-row-1'), 1)).toBe(true);
+    expect(screen.queryByTestId('precedence-badge')).toBeNull();
+
+    // 在草稿里写入“2 先于 1”但不应用
+    const editor = screen.getByTestId('precedence-editor') as HTMLTextAreaElement;
+    fireEvent.change(editor, { target: { value: '2, 1' } });
+    // 候选区仍无“已应用”徽标（草稿未生效），旧候选首名仍以 1 开头（不被草稿污染）
+    expect(screen.queryByTestId('precedence-badge')).toBeNull();
+    expect(sequenceTextStartsWith(screen.getByTestId('candidate-row-1'), 1)).toBe(true);
+
+    // 应用后：徽标出现；等费矩阵约束内字典序最小首名为 2,1,3,...,12
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+    expect(screen.getByTestId('precedence-badge').textContent).toContain('1 条');
+    const row1 = screen.getByTestId('candidate-row-1');
+    expect(sequenceTextStartsWith(row1, 1)).toBe(false);
+    expect(sequenceTextStartsWith(row1, 2)).toBe(true);
+    // 第二节点应为 1（2→1 是约束下最前的开头）
+    const text = row1.querySelector('.route-line')?.textContent ?? '';
+    expect(text).toMatch(/2→1/);
+  });
+
+  it('非法依赖（自指/环/姿态不存在）就地整批拒绝，候选与已生效计划不被污染', () => {
+    render(<App />);
+    const editor = screen.getByTestId('precedence-editor') as HTMLTextAreaElement;
+
+    // 自指
+    fireEvent.change(editor, { target: { value: '3, 3' } });
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+    expect(screen.getByRole('alert').textContent).toContain('不可自指');
+    expect(screen.queryByTestId('precedence-badge')).toBeNull();
+
+    // 相互约束（二元环）
+    fireEvent.change(editor, { target: { value: '1, 3\n3, 1' } });
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+    expect(screen.getByRole('alert').textContent).toMatch(/环|相互约束/);
+    expect(screen.queryByTestId('precedence-badge')).toBeNull();
+
+    // 姿态不存在（N=12 时 13）
+    fireEvent.change(editor, { target: { value: '1, 13' } });
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+    expect(screen.getByRole('alert').textContent).toContain('姿态');
+    expect(screen.queryByTestId('precedence-badge')).toBeNull();
+
+    // 草稿语法错误（不是“a, b”）
+    fireEvent.change(editor, { target: { value: '一, 二' } });
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+    expect(screen.getByRole('alert').textContent).toContain('无法解析');
+  });
+
+  it('App 全链路：应用 1→3 依赖后执行，拒绝 3、确认 1、再确认 3，路线与指标同步', () => {
+    render(<App />);
+
+    // 先导入一份 N=8 等费矩阵（费用 1），再在依赖草稿中加 1→3
+    fireEvent.change(screen.getByPlaceholderText(/n/), {
+      target: { value: JSON.stringify({ n: 8, matrix: matrixToNested(planWith(8, 1)) }) },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /解析并载入草稿/ }));
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+
+    const editor = screen.getByTestId('precedence-editor') as HTMLTextAreaElement;
+    fireEvent.change(editor, { target: { value: '1, 3' } });
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+    expect(screen.getByTestId('precedence-badge')).toBeTruthy();
+
+    // 每条候选都满足关系：首名路线中姿态 1 出现在姿态 3 之前
+    const firstRoute = screen
+      .getByTestId('candidate-row-1')
+      .querySelector('.route-line')?.textContent;
+    expect(firstRoute!.indexOf('1')).toBeLessThan(firstRoute!.indexOf('3'));
+
+    fireEvent.click(screen.getByRole('button', { name: /开始执行/ }));
+
+    // 初始：姿态 3 被标记阻塞（1 尚未确认）
+    const blocked3 = screen.getByTestId('pose-blocked-3') as HTMLButtonElement;
+    expect(blocked3.classList.contains('blocked')).toBe(true);
+    expect(blocked3.title).toContain('需先确认：1');
+
+    // 点击 3 被拒绝：出现 alert，已发生费用仍为 0，已完成计数 0
+    fireEvent.click(blocked3);
+    expect(screen.getByRole('alert').textContent).toContain('先于姿态尚未完成');
+    expect(blocked3.classList.contains('done')).toBe(false);
+
+    // 确认 1 后，3 解锁（不再 blocked）
+    const pose1 = screen.getByTitle(/确认姿态 1 为下一站/);
+    fireEvent.click(pose1);
+    const blocked3after = screen.getByTestId('pose-blocked-3') as HTMLButtonElement;
+    expect(blocked3after.classList.contains('blocked')).toBe(false);
+
+    // 确认 3：成功，已确认 2/8，剩余 6 个姿态；后缀只在剩余 [2,4..8] 上重算
+    fireEvent.click(screen.getByTitle(/确认姿态 3 为下一站/));
+    expect(
+      screen.getAllByText((_, el) => (el?.textContent ?? '').includes('剩余 6 个姿态')).length,
+    ).toBeGreaterThan(0);
+    // 已发生费用：等费矩阵 0→1→3 两条边 = 2
+    expect(screen.getAllByText('2').length).toBeGreaterThan(0);
+
+    // 走完剩余姿态（依赖双方均已完成，不再有任何阻塞），回库结案
+    for (const p of [2, 4, 5, 6, 7, 8]) {
+      fireEvent.click(screen.getByTitle(new RegExp(`确认姿态 ${p} 为下一站`)));
+    }
+    fireEvent.click(screen.getByRole('button', { name: /返回停放位/ }));
+    expect(screen.getByText('已回到停放位 0，结案')).toBeTruthy();
+    // 等费：9 条边 × 1
+    expect(screen.getAllByText('9').length).toBeGreaterThan(0);
+  });
+
+  it('依赖通过 JSON 导入进入草稿：应用前后隔离、清空依赖后恢复无约束结果', () => {
+    render(<App />);
+    const payload = JSON.stringify({
+      n: 8,
+      matrix: matrixToNested(planWith(8, 5)),
+      precedences: [[2, 4]],
+    });
+    fireEvent.change(screen.getByPlaceholderText(/n/), { target: { value: payload } });
+    fireEvent.click(screen.getByRole('button', { name: /解析并载入草稿/ }));
+    // 导入只入草稿：编辑器中能看到关系，但尚未应用（无徽标）
+    const editor = screen.getByTestId('precedence-editor') as HTMLTextAreaElement;
+    expect(editor.value).toContain('2, 4');
+    expect(screen.queryByTestId('precedence-badge')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+    expect(screen.getByTestId('precedence-badge')).toBeTruthy();
+
+    // 清空依赖并应用：徽标消失，恢复无依赖候选
+    fireEvent.change(editor, { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: /校验并应用/ }));
+    expect(screen.queryByTestId('precedence-badge')).toBeNull();
+  });
+
+  it('已应用计划（含依赖）落盘并可重新校验加载；非法依赖拒绝落盘', () => {
+    const plan: CalibrationPlan = { ...createDefaultPlan(8), precedences: [[1, 3], [2, 3]] };
+    savePlan(plan);
+    const raw = localStorage.getItem('dome-calibration-plan-v1')!;
+    expect(raw).toContain('precedences');
+    const reloaded = loadPlan(createDefaultPlan(8));
+    expect(reloaded.precedences).toEqual([
+      [1, 3],
+      [2, 3],
+    ]);
+    expect(reloaded.matrixFlat).toEqual(plan.matrixFlat);
+
+    // 无关系计划落盘不带字段（旧载荷形状），加载仍得到空依赖
+    savePlan(createDefaultPlan(8));
+    expect(localStorage.getItem('dome-calibration-plan-v1')).not.toContain('precedences');
+    expect(loadPlan(createDefaultPlan(8)).precedences).toEqual([]);
   });
 });
 

@@ -29,8 +29,15 @@
  * j*k+r 存 Int8Array（j ≤ 19、r < 3，单字节足够）；现场单最优重排走 k=1 紧凑快路径
  * （每状态单槽，等价原 Held–Karp），保证每拍重排与历史性能一致。
  *
+ * 可选“先于”关系：prereqByPose[p] 是姿态 p 的全局前置位掩码（位 q ⇔ q 必须先于 p）。
+ * 求解时投影到当前目标子集得到局部掩码 preMask[j]；只在 j 的全部局部前置都不在待访集
+ * （即都已访问或本来就不在子集中——执行中途已完成姿态视为满足）时才扩展状态。
+ * 无该参数时退化为原求解，旧输入逐项保持原行为。
+ *
  * 复杂度 O(k·m²·2^m) 时间、O(k·m·2^m) 空间；k=3、m=18 实测亚秒至一秒级。
  */
+
+import { localPrereqMasks } from './precedence';
 
 export const TOP_K = 3;
 
@@ -100,6 +107,7 @@ function elapsedMs(started: number): number {
  * @param targets 需要访问的目标编号（会被复制并按升序排列）
  * @param origin  当前起点（原计划为 0；执行改序时为刚确认的姿态）
  * @param home    最终停放位（始终为 0）
+ * @param prereqByPose 可选：姿态 -> 全局前置位掩码（buildPrereqMasks 构造）
  */
 export function solveOptimal(
   flat: ArrayLike<number>,
@@ -107,6 +115,7 @@ export function solveOptimal(
   targets: ArrayLike<number>,
   origin: number,
   home: number,
+  prereqByPose?: ArrayLike<number>,
 ): OptimalRoute {
   const started =
     typeof performance !== 'undefined' && typeof performance.now === 'function'
@@ -116,6 +125,8 @@ export function solveOptimal(
   const m = targets.length;
   const sorted = Array.from(targets).sort((a, b) => a - b);
   const edge = (a: number, b: number): number => flat[a * dim + b]!;
+  // 局部前置掩码：preMask[j] 中的位是“也在目标子集内、必须先于 sorted[j]”的姿态下标。
+  const preMask = localPrereqMasks(sorted, prereqByPose);
 
   // 无目标：只剩 origin -> home 一条边（执行到最后一个姿态后，预计返回即此值）。
   if (m === 0) {
@@ -161,6 +172,9 @@ export function solveOptimal(
         const j = countTrailingZeros(members);
         members &= members - 1;
 
+        // “先于”门控：j 的局部前置不能仍在待访集合中（必须已访问/不在子集内）。
+        if (mask & preMask[j]!) continue;
+
         const candidate =
           flat[fromRow + sorted[j]!]! + g[(mask ^ (1 << j)) * m + j]!;
         if (candidate < best) {
@@ -188,11 +202,18 @@ export function solveOptimal(
       const b = countTrailingZeros(bits);
       bits &= bits - 1;
 
+      // “先于”门控：b 的局部前置必须都不在剩余集合中（已访问/已完成）。
+      if (remaining & preMask[b]!) continue;
+
       const value = edge(cur, sorted[b]!) + g[(remaining ^ (1 << b)) * m + b]!;
       if (value < chosenValue) {
         chosenValue = value;
         chosen = b;
       }
+    }
+    if (chosen < 0) {
+      // 剩余姿态的“先于”图无拓扑序（防御：合法计划的完整图已在提交时保证无环）。
+      throw new Error('当前“先于”约束下不存在可行路线（依赖环或前置姿态无法访问）');
     }
     const nextPose = sorted[chosen]!;
     sequence.push(nextPose);
@@ -212,6 +233,10 @@ export function solveOptimal(
  * 校准路线候选集：按总耗时升序、同费按完整姿态序列字典序升序排列的前 k 条
  * 互异精确路线；互异路线总数不足 k 时只返回实际数量。每个 DP 状态一次保留固定
  * k 个不同后缀及子排名（k=TOP_K），不靠反复调用单最优求解器。
+ *
+ * @param prereqByPose 可选“先于”关系：姿态 -> 全局前置位掩码。规划器只在某姿态的
+ *                     全部前置都已访问（执行重排时：不在剩余子集中）时才把它作为下一姿态；
+ *                     约束下可行路线不足 k 条时只返回实际数量，一条都没有时返回空候选集。
  */
 export function solveTopRoutes(
   flat: ArrayLike<number>,
@@ -219,6 +244,7 @@ export function solveTopRoutes(
   targets: ArrayLike<number>,
   origin: number,
   home: number,
+  prereqByPose?: ArrayLike<number>,
 ): CandidateSet {
   const started =
     typeof performance !== 'undefined' && typeof performance.now === 'function'
@@ -229,6 +255,7 @@ export function solveTopRoutes(
   const m = targets.length;
   const sorted = Array.from(targets).sort((a, b) => a - b);
   const edge = (a: number, b: number): number => flat[a * dim + b]!;
+  const preMask = localPrereqMasks(sorted, prereqByPose);
 
   // 无目标：只剩 origin -> home 一条路线。
   if (m === 0) {
@@ -283,6 +310,9 @@ export function solveTopRoutes(
         const j = countTrailingZeros(members);
         members &= members - 1;
 
+        // “先于”门控：j 的局部前置不能仍在待访集合中。
+        if (mask & preMask[j]!) continue;
+
         const stepCost = flat[fromRow + sorted[j]!]!;
         const childBase = (mask ^ (1 << j)) * m + j;
         for (let r = 0; r < k; r++) {
@@ -323,6 +353,8 @@ export function solveTopRoutes(
   const ansI = new Int8Array(k);
   const ansR = new Int8Array(k);
   for (let i = 0; i < m; i++) {
+    // 首个姿态必须没有任何“仍在目标集内”的前置（preMask[i] === 0）。
+    if (preMask[i] !== 0) continue;
     const stepCost = edge(origin, sorted[i]!);
     const childBase = (full ^ (1 << i)) * m + i;
     for (let r = 0; r < k; r++) {

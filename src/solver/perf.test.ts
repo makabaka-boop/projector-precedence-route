@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { solveOptimal, solveTopRoutes } from './tsp';
 import { startExecution, confirmNext, finishReturn } from './execution';
-import { makeRng, randomMatrix } from './brute';
+import { buildPrereqMasks } from './precedence';
+import { makeRng, randomMatrix, randomPrecedences } from './brute';
 
 /**
  * 验收硬指标：N=18（19×19 非对称矩阵）的精确求解必须在 4 秒内完成；
@@ -80,4 +81,37 @@ describe('性能：N=18 停机窗口', () => {
   function plan(flat: number[]) {
     return { n: 18, matrixFlat: flat };
   }
+
+  it('带“先于”关系（中等密度随机无环图）：三条候选与逐拍重排均 < 4 秒', () => {
+    const n = 18;
+    const flat = randomMatrix(n + 1, makeRng(2029));
+    const pairs = randomPrecedences(n, makeRng(2030), 0.12);
+    expect(pairs.length).toBeGreaterThan(0);
+    const prereq = buildPrereqMasks(pairs, n);
+    const targets = Array.from({ length: n }, (_, k) => k + 1);
+
+    const set = solveTopRoutes(flat, n + 1, targets, 0, 0, prereq);
+    expect(set.candidates.length).toBeGreaterThan(0);
+    expect(set.candidates.length).toBeLessThanOrEqual(3);
+    for (const c of set.candidates) {
+      expect(c.sequence).toHaveLength(18);
+      expect(new Set(c.sequence).size).toBe(18);
+    }
+    console.log(
+      `N=18 带 ${pairs.length} 条先于关系的三条候选耗时：${set.solveMs.toFixed(1)} ms（${set.candidates.length} 条）`,
+    );
+    expect(set.solveMs).toBeLessThan(4000);
+
+    // 逐拍：始终确认当前精确后缀推荐的下一站（天然满足前置），每拍重排计时
+    let state = startExecution({ n, matrixFlat: flat, precedences: pairs });
+    expect(state.suffix.solveMs).toBeLessThan(4000);
+    let guard = 0;
+    while (state.remaining.length > 0 && guard++ < n + 1) {
+      const next = state.suffix.sequence[0]!;
+      state = confirmNext(state, next);
+      expect(state.suffix.solveMs).toBeLessThan(4000);
+    }
+    state = finishReturn(state);
+    expect(state.finished).toBe(true);
+  });
 });

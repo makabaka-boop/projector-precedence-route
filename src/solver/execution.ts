@@ -5,13 +5,16 @@
  * - startExecution：以工程师在校准路线候选集中选定的路线（默认候选首名，即精确
  *   最优）作为“原计划及增量基线”；初始最短后缀仍是当前剩余姿态集合上的精确最优，
  *   因此基线本身是次优候选时，初始增量允许为负。
- * - confirmNext：工程师把任一“未完成”姿态确认为实际下一站；
- *   累加实际已发生费用，并以该姿态为新起点，对全部剩余姿态精确重排（Held–Karp），
- *   得到最短收尾路线、预计完工耗时及相对“所选候选基线”的增量。
+ * - confirmNext：工程师把任一“未完成且其全部先于姿态均已确认”的姿态确认为实际
+ *   下一站；前置未满足的确认会被拒绝且原状态（已确认进度）原样保留。确认后累加
+ *   实际已发生费用，并以该姿态为新起点，在剩余姿态上（继续遵守依赖；已完成姿态
+ *   视为满足）精确重排（Held–Karp），得到最短收尾路线、预计完工耗时及相对“所选
+ *   候选基线”的增量。
  * - finishReturn：剩余为空后，回到停放位 0，结算最终费用。
  */
 
 import { type CalibrationPlan } from './plan';
+import { buildPrereqMasks } from './precedence';
 import { solveOptimal, type OptimalRoute, type RouteCandidate } from './tsp';
 
 export interface ExecutionState {
@@ -32,6 +35,11 @@ export interface ExecutionState {
   suffix: OptimalRoute;
   /** 是否已回到停放位 0 结案 */
   finished: boolean;
+  /**
+   * 各姿态的全局前置位掩码（位 q ⇔ 姿态 q 必须先于该姿态）。
+   * 中途重排时按剩余子集投影：已完成姿态（不在子集中）视为满足。
+   */
+  prereqByPose: Uint32Array;
 }
 
 /**
@@ -43,6 +51,7 @@ export function startExecution(
   baseline?: RouteCandidate,
 ): ExecutionState {
   const all = range1(plan.n);
+  const prereqByPose = buildPrereqMasks(plan.precedences ?? [], plan.n);
   const selected: OptimalRoute = baseline
     ? {
         sequence: baseline.sequence,
@@ -51,14 +60,15 @@ export function startExecution(
         targetCount: baseline.targetCount,
         solveMs: 0,
       }
-    : solveOptimal(plan.matrixFlat, plan.n + 1, all, 0, 0);
+    : solveOptimal(plan.matrixFlat, plan.n + 1, all, 0, 0, prereqByPose);
 
   // 初始后缀始终是“从 0 出发遍历全部姿态”的精确最短后缀（而非基线照抄）：
   // 基线选次优候选时，最短后缀严格更短，初始增量即为负。
+  // “先于”关系全程生效：候选首名与初始最短后缀都在约束下求出。
   const suffix =
     baseline && baseline.rank === 1
       ? { ...selected, solveMs: 0 }
-      : solveOptimal(plan.matrixFlat, plan.n + 1, all, 0, 0);
+      : solveOptimal(plan.matrixFlat, plan.n + 1, all, 0, 0, prereqByPose);
 
   return {
     plan,
@@ -70,6 +80,7 @@ export function startExecution(
     remaining: all,
     suffix,
     finished: false,
+    prereqByPose,
   };
 }
 
@@ -88,11 +99,31 @@ export function confirmNext(state: ExecutionState, pose: number): ExecutionState
     throw new Error(`姿态 ${pose} 不在剩余列表中`);
   }
 
+  // “先于”前置检查：该姿态要求先完成的姿态必须都已确认（已完成姿态视为满足；
+  // 前置位不在剩余集合即说明已经走过）。不满足则拒绝，调用方保留当前进度不变。
+  const requiredMask = state.prereqByPose[pose]!;
+  const remainingSetMask = state.remaining.reduce((mask, p) => mask | (1 << p), 0);
+  const unsatisfied = requiredMask & remainingSetMask;
+  if (unsatisfied !== 0) {
+    const waiting: number[] = [];
+    let bits = unsatisfied;
+    while (bits !== 0) {
+      const lsb = bits & -bits;
+      waiting.push(31 - Math.clz32(lsb));
+      bits &= bits - 1;
+    }
+    waiting.sort((a, b) => a - b);
+    throw new Error(
+      `姿态 ${pose} 的先于姿态尚未完成（需先确认：${waiting.join('、')}），已确认进度保留`,
+    );
+  }
+
   const dim = n + 1;
   const incurred = state.incurred + matrixFlat[state.current * dim + pose]!;
   const visited = [...state.visited, pose];
   const remaining = state.remaining.filter((p) => p !== pose);
-  const suffix = solveOptimal(matrixFlat, dim, remaining, pose, 0);
+  // 中途重算只在剩余姿态上继续遵守依赖；不在剩余子集中的前置（即已完成姿态）自动满足。
+  const suffix = solveOptimal(matrixFlat, dim, remaining, pose, 0, state.prereqByPose);
 
   return {
     ...state,

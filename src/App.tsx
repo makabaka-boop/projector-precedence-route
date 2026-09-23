@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { type CalibrationPlan, createDefaultPlan } from './solver/plan';
 import { solveTopRoutes } from './solver/tsp';
+import { buildPrereqMasks } from './solver/precedence';
 import { MatrixEditor } from './components/MatrixEditor';
 import { ExecutionConsole } from './components/ExecutionConsole';
 import { CandidatePicker } from './components/CandidatePicker';
@@ -19,14 +20,19 @@ export function App() {
   const [selectedRank, setSelectedRank] = useState(1);
 
   // 当前已生效计划的校准路线候选集（扩展 Held–Karp 一次给出前三名互异精确路线）。
-  // 应用新矩阵时 plan 引用更换，旧候选与选择随之失效：下面的 effect 立即重算并重置选择。
+  // 应用新矩阵（含“先于”关系）时 plan 引用更换，旧候选与选择随之失效：下面的 effect
+  // 立即重算并重置选择。可选“先于”关系作为前置位掩码传入，规划器只扩展前置已访问的姿态。
   const allTargets = useMemo(
     () => Array.from({ length: plan.n }, (_, k) => k + 1),
     [plan.n],
   );
+  const prereqByPose = useMemo(
+    () => buildPrereqMasks(plan.precedences ?? [], plan.n),
+    [plan],
+  );
   const candidateSet = useMemo(
-    () => solveTopRoutes(plan.matrixFlat, plan.n + 1, allTargets, 0, 0),
-    [plan, allTargets],
+    () => solveTopRoutes(plan.matrixFlat, plan.n + 1, allTargets, 0, 0, prereqByPose),
+    [plan, allTargets, prereqByPose],
   );
 
   // 新计划生效：选择回到候选首名（旧候选与旧选择一起作废）。
@@ -45,9 +51,10 @@ export function App() {
     setPlan(fallback);
   }
 
+  const hasCandidates = candidateSet.candidates.length > 0;
   const selected =
     candidateSet.candidates.find((c) => c.rank === selectedRank) ??
-    candidateSet.candidates[0]!;
+    candidateSet.candidates[0];
 
   return (
     <div className="app">
@@ -75,12 +82,15 @@ export function App() {
         </button>
         <button
           className={`tab ${tab === 'execute' ? 'active' : ''}`}
+          disabled={!hasCandidates}
+          title={hasCandidates ? '' : '当前“先于”约束下没有可行路线，请先回到编辑台解除约束'}
           onClick={() => {
+            if (!hasCandidates) return;
             setPlanVersion((v) => v + 1);
             setTab('execute');
           }}
         >
-          2. 开始执行（当前选择：候选第 {selected.rank} 名）
+          2. 开始执行（当前选择：候选第 {selected ? selected.rank : '—'} 名）
         </button>
       </nav>
 
@@ -89,7 +99,7 @@ export function App() {
           <CandidatePicker
             plan={plan}
             candidateSet={candidateSet}
-            selectedRank={selected.rank}
+            selectedRank={selectedRank}
             onSelect={setSelectedRank}
           />
 
@@ -97,7 +107,7 @@ export function App() {
         </>
       )}
 
-      {tab === 'execute' && (
+      {tab === 'execute' && selected && (
         <ExecutionConsole
           key={planVersion}
           plan={plan}

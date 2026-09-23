@@ -7,6 +7,10 @@ import {
   type CalibrationPlan,
   validatePlan,
 } from '../solver/plan';
+import {
+  formatPrecedenceText,
+  parsePrecedenceText,
+} from '../solver/precedence';
 
 interface MatrixEditorProps {
   /** 已生效的计划（导入/应用失败时始终保留它） */
@@ -16,8 +20,8 @@ interface MatrixEditorProps {
 
 /**
  * 编辑台：可改 N、可逐格编辑费用、可粘贴/导入 JSON、可导出。
- * 草稿与“已生效计划”分离：只有整批校验通过才调用 onApply；
- * 任一缺项或越界都就地显示错误并保留旧计划。
+ * 草稿与“已生效计划”分离：只有整批校验通过（矩阵 + 可选“先于”关系）才调用 onApply；
+ * 任一缺项、越界或非法依赖（姿态不存在/自指/有环）都就地显示错误并保留旧计划。
  */
 export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
   const [n, setN] = useState<number>(plan.n);
@@ -25,6 +29,10 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
   const [errors, setErrors] = useState<string[]>([]);
   const [notice, setNotice] = useState<string>('');
   const [jsonText, setJsonText] = useState<string>('');
+  // “先于”关系草稿：未点“校验并应用”前绝不影响已生效计划与候选集。
+  const [precedenceText, setPrecedenceText] = useState<string>(() =>
+    formatPrecedenceText(plan.precedences ?? []),
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const dim = n + 1;
@@ -78,15 +86,29 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
   function commit() {
     const nested: number[][] = [];
     for (let i = 0; i < dim; i++) nested.push(cells.slice(i * dim, (i + 1) * dim));
-    const result = validatePlan({ n, matrix: nested });
+
+    // 先解析“先于”草稿（逐行语法错误在此暴露），再连同矩阵一起整批校验。
+    const draft = parsePrecedenceText(precedenceText);
+    if (draft.errors.length > 0) {
+      setErrors([...draft.errors, '整批拒绝：当前已生效计划（含其依赖）保持不变。']);
+      setNotice('');
+      return;
+    }
+
+    const result = validatePlan({ n, matrix: nested, precedences: draft.pairs });
     if (!result.ok || !result.plan) {
-      setErrors(result.errors);
+      setErrors([...result.errors, '整批拒绝：当前已生效计划（含其依赖）保持不变。']);
       setNotice('');
       return;
     }
     setErrors([]);
-    setNotice(`计划已生效：N=${result.plan.n}，费用矩阵 (${dim}×${dim}) 全部合法。`);
+    const pairCount = result.plan.precedences?.length ?? 0;
+    setNotice(
+      `计划已生效：N=${result.plan.n}，费用矩阵 (${dim}×${dim}) 全部合法，“先于”关系 ${pairCount} 条。`,
+    );
     onApply(result.plan);
+    // 已生效关系规范化回写草稿（去重、排序），与“已应用计划”保持单一真源
+    setPrecedenceText(formatPrecedenceText(result.plan.precedences ?? []));
   }
 
   function applyJson(text: string) {
@@ -106,8 +128,11 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
     }
     setN(result.plan.n);
     setCells(result.plan.matrixFlat);
+    setPrecedenceText(formatPrecedenceText(result.plan.precedences ?? []));
     setErrors([]);
-    setNotice(`导入成功：N=${result.plan.n}。点击“校验并应用”后才会替换当前计划。`);
+    setNotice(
+      `导入成功：N=${result.plan.n}，“先于”关系 ${result.plan.precedences?.length ?? 0} 条。点击“校验并应用”后才会替换当前计划。`,
+    );
   }
 
   function importJson() {
@@ -136,17 +161,21 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
   function exportJson() {
     const nested: number[][] = [];
     for (let i = 0; i < dim; i++) nested.push(cells.slice(i * dim, (i + 1) * dim));
-    const text = JSON.stringify({ n, matrix: nested }, null, 2);
-    setJsonText(text);
-    setNotice('已把当前网格序列化为 JSON（仍以已生效计划为准，除非再应用）。');
+    const draft = parsePrecedenceText(precedenceText);
+    // 导出当前网格与当前依赖草稿（无关系时不带字段，与旧 JSON 形态一致）
+    const payload: Record<string, unknown> = { n, matrix: nested };
+    if (draft.pairs.length > 0) payload.precedences = draft.pairs;
+    setJsonText(JSON.stringify(payload, null, 2));
+    setNotice('已把当前网格与依赖草稿序列化为 JSON（仍以已生效计划为准，除非再应用）。');
   }
 
   const columnHeaders = useMemo(() => Array.from({ length: dim }, (_, k) => k), [dim]);
 
   useEffect(() => {
-    // 外部（如“恢复默认”）更换计划时同步草稿
+    // 外部（如“恢复默认”）更换计划时同步草稿：矩阵与“先于”关系都以已生效计划为准
     setN(plan.n);
     setCells(plan.matrixFlat);
+    setPrecedenceText(formatPrecedenceText(plan.precedences ?? []));
   }, [plan]);
 
   const invalidCount = cells.filter((v, idx) => {
@@ -264,6 +293,38 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
       </div>
 
       <div className="panel">
+        <h2>
+          “先于”关系草稿（可选）
+          <span className="muted" style={{ fontWeight: 400, fontSize: 12, marginLeft: 10 }}>
+            已生效 {(plan.precedences ?? []).length} 条 · 草稿与已应用计划分离，应用前不影响路线
+          </span>
+        </h2>
+        <div className="hint" style={{ marginBottom: 8 }}>
+          每行一条 “前置, 后置”（也支持 <code>a -&gt; b</code> / <code>a→b</code> /
+          “a 先于 b”）。含义：前置姿态必须先于后置姿态完成测量。提交时校验姿态存在
+          （1—{n}）、不可自指、依赖图无环；非法依赖整批拒绝，上次有效计划与候选路线不被污染。
+          清空并应用即移除全部关系。
+        </div>
+        <textarea
+          spellCheck={false}
+          data-testid="precedence-editor"
+          value={precedenceText}
+          placeholder={'# 例如：\n1, 3\n2 -> 3\n1 先于 5'}
+          onChange={(e) => {
+            setPrecedenceText(e.target.value);
+            setErrors([]);
+            setNotice('');
+          }}
+          style={{ minHeight: 110 }}
+        />
+        <div className="row" style={{ marginTop: 8 }}>
+          <span className="muted">
+            当前草稿 {parsePrecedenceText(precedenceText).pairs.length} 条（含传递/重复时提交会去重）
+          </span>
+        </div>
+      </div>
+
+      <div className="panel">
         <h2>JSON 编辑 / 导入</h2>
         <textarea
           spellCheck={false}
@@ -276,7 +337,7 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
             解析并载入草稿
           </button>
           <span className="muted">
-            支持 {'{ "n": 8, "matrix": [[...]] }'} 或裸二维数组；校验通过才进入网格。
+            支持 {'{ "n": 8, "matrix": [[...]], "precedences": [[1, 3]] }'} 或裸二维数组；校验通过才进入网格。
           </span>
         </div>
       </div>

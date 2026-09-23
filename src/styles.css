@@ -370,6 +370,24 @@ table.matrix input:focus {
   background: #16201b;
 }
 
+.pose-btn.blocked {
+  border-color: var(--warn);
+  background: #2a2214;
+  opacity: 0.85;
+}
+
+.prec-chip {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0 7px;
+  margin: 0 4px 2px 0;
+  color: var(--text);
+  background: var(--panel-2);
+}
+
 .pose-btn .pose-id {
   font-size: 16px;
   font-family: var(--mono);

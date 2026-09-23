@@ -5,8 +5,12 @@
  * - 姿态编号 1..N（N 取 8—18），0 为停放位。
  * - 费用矩阵为 (N+1)×(N+1) 的方阵，行优先二维数组。
  * - 主对角线必须为 0；其余项必须是 1..9999 的整数（费用有方向性，矩阵不必对称）。
- * - 任一缺项、越界或形状不符，整批拒绝（调用方保留旧计划）。
+ * - 可选 precedences（先于关系）：[a, b] 表示姿态 a 必须先于姿态 b 完成；
+ *   姿态必须存在、不可自指、依赖图必须无环，否则整批拒绝。
+ * - 任一缺项、越界、形状不符或非法依赖，整批拒绝（调用方保留旧计划）。
  */
+
+import { validatePrecedences, type Precedence } from './precedence';
 
 export const N_MIN = 8;
 export const N_MAX = 18;
@@ -18,6 +22,12 @@ export interface CalibrationPlan {
   n: number;
   /** (n+1)² 个费用，行优先；matrix[i][j] = matrixFlat[i*(n+1)+j] */
   matrixFlat: number[];
+  /**
+   * 可选“先于”关系（已校验：姿态存在、无自指、无环，已去重并按 (a,b) 升序）。
+   * 旧输入/旧测试没有该字段时一律按空列表处理——无依赖的旧输入逐项保持原行为；
+   * 凡经 validatePlan 产出的计划都显式带 []。
+   */
+  precedences?: Precedence[];
 }
 
 export interface ValidationResult {
@@ -32,12 +42,14 @@ export interface ValidationResult {
  * 校验工程师编辑或导入的 JSON。
  * 接受形如 { "n": 10, "matrix": [[0, ...], ...] } 或 { "n": 10, "costs": [[...]] } 的对象，
  * 也接受裸二维数组（此时 n = 边长 - 1）。
+ * 可选 "precedences"（别名 "before"）为 [前置姿态, 后置姿态] 的数组。
  */
 export function validatePlan(input: unknown): ValidationResult {
   const errors: string[] = [];
 
   let matrix: unknown;
   let nCandidate: unknown;
+  let precedencesRaw: unknown;
 
   if (Array.isArray(input)) {
     matrix = input;
@@ -46,6 +58,9 @@ export function validatePlan(input: unknown): ValidationResult {
     matrix =
       (input as Record<string, unknown>).matrix ??
       (input as Record<string, unknown>).costs;
+    precedencesRaw =
+      (input as Record<string, unknown>).precedences ??
+      (input as Record<string, unknown>).before;
   } else {
     return { ok: false, errors: ['JSON 顶层必须是对象（含 n 与 matrix）或二维数组'] };
   }
@@ -140,10 +155,17 @@ export function validatePlan(input: unknown): ValidationResult {
     return { ok: false, errors: dedupe(errors) };
   }
 
-  return { ok: true, plan: { n, matrixFlat: flat }, errors: [] };
+  // 费用全部合法后再校验可选“先于”关系：姿态存在、不可自指、依赖图无环。
+  // 非法依赖整批拒绝（errors 非空即不产出 plan），调用方保留旧计划。
+  const prec = validatePrecedences(precedencesRaw, n);
+  if (!prec.ok || !prec.pairs) {
+    return { ok: false, errors: prec.errors };
+  }
+
+  return { ok: true, plan: { n, matrixFlat: flat, precedences: prec.pairs }, errors: [] };
 }
 
-/** 生成默认合法计划：对角线 0，非对角默认 1（工程师可改出方向性）。 */
+/** 生成默认合法计划：对角线 0，非对角默认 1（工程师可改出方向性），无“先于”关系。 */
 export function createDefaultPlan(n: number): CalibrationPlan {
   const dim = n + 1;
   const matrixFlat = new Array<number>(dim * dim);
@@ -152,7 +174,7 @@ export function createDefaultPlan(n: number): CalibrationPlan {
       matrixFlat[i * dim + j] = i === j ? 0 : 1;
     }
   }
-  return { n, matrixFlat };
+  return { n, matrixFlat, precedences: [] };
 }
 
 export function matrixToNested(plan: CalibrationPlan): number[][] {

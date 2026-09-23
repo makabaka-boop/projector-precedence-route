@@ -32,8 +32,12 @@ export function ExecutionConsole({
   const [error, setError] = useState<string>('');
 
   function confirm(pose: number) {
+    // 直接基于当前渲染闭包的 state 计算下一状态：前置不满足时 confirmNext 抛错，
+    // 必须让错误在事件处理器内被捕获（放进 setState 更新函数里会逃逸到 React 渲染阶段），
+    // 拒绝时不调用 setState，已确认进度原样保留。
     try {
-      setState((s) => confirmNext(s, pose));
+      const next = confirmNext(state, pose);
+      setState(next);
       setError('');
     } catch (e) {
       setError((e as Error).message);
@@ -42,7 +46,8 @@ export function ExecutionConsole({
 
   function goHome() {
     try {
-      setState((s) => finishReturn(s));
+      const next = finishReturn(state);
+      setState(next);
       setError('');
     } catch (e) {
       setError((e as Error).message);
@@ -55,6 +60,14 @@ export function ExecutionConsole({
   const edgeAt = (a: number, b: number) => plan.matrixFlat[a * dim + b]!;
   const recommendedNext = state.suffix.sequence[0];
   const rank = baselineRank ?? state.baselineRank;
+
+  /** 未完成但前置尚未全部确认的姿态：点击会被状态机拒绝（保留已确认进度）。 */
+  function blockedByPrereq(pose: number): number[] {
+    const bits = state.preByPose[pose] ?? 0;
+    if (bits === 0) return [];
+    return state.remaining.filter((p) => p !== pose && (bits & (1 << p)) !== 0);
+  }
+  const prereqEdges = plan.prerequisites ?? [];
 
   return (
     <div>
@@ -118,6 +131,14 @@ export function ExecutionConsole({
           </div>
         )}
 
+        {prereqEdges.length > 0 && !state.finished && (
+          <div className="alert info" role="status" data-testid="exec-prereq-banner">
+            本次执行遵守 {prereqEdges.length} 条“先于”约束：
+            {prereqEdges.map(([a, b]) => `${a}→${b}`).join('、')}
+            。前置未确认时点击后置姿态会被拒绝，已确认进度保留；中途重排只在剩余姿态上继续遵守依赖。
+          </div>
+        )}
+
         {error && (
           <div className="alert error" role="alert">
             {error}
@@ -167,6 +188,8 @@ export function ExecutionConsole({
                 const done = state.visited.includes(pose);
                 const recommended = pose === recommendedNext;
                 const moveCost = edgeAt(state.current, pose);
+                const blocked = done ? [] : blockedByPrereq(pose);
+                const locked = blocked.length > 0;
                 return (
                   <button
                     key={pose}
@@ -174,18 +197,32 @@ export function ExecutionConsole({
                       'pose-btn',
                       done ? 'done' : '',
                       recommended ? 'recommended' : '',
+                      locked ? 'locked-prereq' : '',
                     ].join(' ')}
                     disabled={done}
                     onClick={() => confirm(pose)}
+                    aria-label={
+                      done
+                        ? `姿态 ${pose} 已完成`
+                        : locked
+                          ? `姿态 ${pose} 前置未完成：${blocked.join('、')}`
+                          : `确认姿态 ${pose} 为下一站`
+                    }
                     title={
                       done
                         ? `姿态 ${pose} 已完成，不得再次确认`
-                        : `确认姿态 ${pose} 为下一站，本步镜组转动费用 ${moveCost}`
+                        : locked
+                          ? `姿态 ${pose} 的前置姿态 ${blocked.join('、')} 尚未确认；点击会被拒绝且保留已确认进度`
+                          : `确认姿态 ${pose} 为下一站，本步镜组转动费用 ${moveCost}`
                     }
                   >
                     <span className="pose-id">姿态 {pose}</span>
                     {done ? (
                       <span className="pose-meta">已完成 · 禁用</span>
+                    ) : locked ? (
+                      <span className="pose-meta">
+                        🔒 待前置 {blocked.join('、')} · 点击将被拒绝
+                      </span>
                     ) : recommended ? (
                       <span className="pose-meta">
                         ★ 精确后缀推荐 · 本步费用 {moveCost}

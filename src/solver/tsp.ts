@@ -29,6 +29,13 @@
  * j*k+r 存 Int8Array（j ≤ 19、r < 3，单字节足够）；现场单最优重排走 k=1 紧凑快路径
  * （每状态单槽，等价原 Held–Karp），保证每拍重排与历史性能一致。
  *
+ * 可选“先于”约束（preByPose，按姿态编号取位的掩码：preByPose[b] 的第 a 位为 1 表示
+ * a 必须先于 b）：状态只在后继 j 的全部前置都已访问时扩展。在“从 i 出发、还要走 mask”
+ * 的视角下，已访问集合 = 全部目标 \\ (mask ∪ {i})，故 j 可扩展当且仅当
+ * (preMask[j] & mask) === 0——j 的前置只要还落在待走集合 mask 中即必须让位；
+ * 前置若不属于当前目标集合（执行中途已完成），其位不在 mask 内，自动视为满足。
+ * 无 preByPose 或掩码全 0 时退化为原始 TSP，费用、序列、tie-break 逐项不变。
+ *
  * 复杂度 O(k·m²·2^m) 时间、O(k·m·2^m) 空间；k=3、m=18 实测亚秒至一秒级。
  */
 
@@ -68,7 +75,18 @@ export interface CandidateSet {
   targetCount: number;
   /** 求解耗时（毫秒） */
   solveMs: number;
+  /**
+   * 约束下是否存在可行路线。“先于”图由计划层保证无环；此处对不可行
+   * （理论上不会发生的防御分支）给出空候选并标记 false，调用方不得把它当计划。
+   */
+  feasible: boolean;
 }
+
+/**
+ * “先于”约束：按姿态编号取位的掩码数组（下标即姿态编号）。
+ * 省略或掩码全 0 表示无约束；见文件头的可扩展条件说明。
+ */
+export type PrerequisiteMasks = ArrayLike<number> | undefined;
 
 /**
  * 无穷远哨兵。注意：g 表是 Int32Array，fill 的值必须落在有符号 32 位范围内——
@@ -92,6 +110,32 @@ function elapsedMs(started: number): number {
 }
 
 /**
+ * 把按姿态编号取位的全局前置掩码映射到 sorted 目标数组的本地位：
+ * local[j] 的第 p 位为 1 ⇔ sorted[p] 必须先于 sorted[j]。
+ * 不属于当前目标集合的前置（执行中途已完成的姿态）被丢弃，自动视为满足。
+ * 无约束时返回 undefined，求解循环走零成本原始路径。
+ */
+function toLocalPreMasks(
+  preByPose: PrerequisiteMasks,
+  sorted: number[],
+): Uint32Array | undefined {
+  if (!preByPose) return undefined;
+  const m = sorted.length;
+  const local = new Uint32Array(m);
+  let any = 0;
+  for (let j = 0; j < m; j++) {
+    let bits = 0;
+    const global = preByPose[sorted[j]!] ?? 0;
+    for (let p = 0; p < m; p++) {
+      if ((global & (1 << sorted[p]!)) !== 0) bits |= 1 << p;
+    }
+    local[j] = bits;
+    any |= bits;
+  }
+  return any === 0 ? undefined : local;
+}
+
+/**
  * 精确最优路线：单槽 Held–Karp 紧凑快路径（现场每拍后缀重排使用）。
  * 结果恒等于 solveTopRoutes 的候选首名。
  *
@@ -100,6 +144,7 @@ function elapsedMs(started: number): number {
  * @param targets 需要访问的目标编号（会被复制并按升序排列）
  * @param origin  当前起点（原计划为 0；执行改序时为刚确认的姿态）
  * @param home    最终停放位（始终为 0）
+ * @param preByPose 可选“先于”约束（按姿态编号取位的掩码数组）；仅在前置已访问时扩展
  */
 export function solveOptimal(
   flat: ArrayLike<number>,
@@ -107,6 +152,7 @@ export function solveOptimal(
   targets: ArrayLike<number>,
   origin: number,
   home: number,
+  preByPose?: PrerequisiteMasks,
 ): OptimalRoute {
   const started =
     typeof performance !== 'undefined' && typeof performance.now === 'function'
@@ -116,6 +162,7 @@ export function solveOptimal(
   const m = targets.length;
   const sorted = Array.from(targets).sort((a, b) => a - b);
   const edge = (a: number, b: number): number => flat[a * dim + b]!;
+  const localPre = toLocalPreMasks(preByPose, sorted);
 
   // 无目标：只剩 origin -> home 一条边（执行到最后一个姿态后，预计返回即此值）。
   if (m === 0) {
@@ -160,6 +207,8 @@ export function solveOptimal(
       while (members !== 0) {
         const j = countTrailingZeros(members);
         members &= members - 1;
+        // “先于”门：j 的任一前置仍在待走集合 mask 中则不得在此扩展。
+        if (localPre && (localPre[j]! & mask) !== 0) continue;
 
         const candidate =
           flat[fromRow + sorted[j]!]! + g[(mask ^ (1 << j)) * m + j]!;
@@ -187,12 +236,18 @@ export function solveOptimal(
     while (bits !== 0) {
       const b = countTrailingZeros(bits);
       bits &= bits - 1;
+      // “先于”门：只剩当前已确认姿态之前的检查在这里等价——待走集合中不得还有 b 的前置。
+      if (localPre && (localPre[b]! & remaining) !== 0) continue;
 
       const value = edge(cur, sorted[b]!) + g[(remaining ^ (1 << b)) * m + b]!;
       if (value < chosenValue) {
         chosenValue = value;
         chosen = b;
       }
+    }
+    if (chosen < 0) {
+      // 计划层已保证无环，任何诱导子问题都可行；走到这里说明约束集本身不可行。
+      throw new Error('前置约束下不存在可行路线（依赖可能成环）');
     }
     const nextPose = sorted[chosen]!;
     sequence.push(nextPose);
@@ -212,6 +267,10 @@ export function solveOptimal(
  * 校准路线候选集：按总耗时升序、同费按完整姿态序列字典序升序排列的前 k 条
  * 互异精确路线；互异路线总数不足 k 时只返回实际数量。每个 DP 状态一次保留固定
  * k 个不同后缀及子排名（k=TOP_K），不靠反复调用单最优求解器。
+ *
+ * preByPose 为可选“先于”约束（按姿态编号取位的掩码数组）：规划器只在候选后继
+ * 的全部前置姿态都已访问时扩展该状态；同费字典序裁决仍在“可行路线集合内部”
+ * 保持原规则。约束下无可行路线时返回空候选且 feasible=false。
  */
 export function solveTopRoutes(
   flat: ArrayLike<number>,
@@ -219,6 +278,7 @@ export function solveTopRoutes(
   targets: ArrayLike<number>,
   origin: number,
   home: number,
+  preByPose?: PrerequisiteMasks,
 ): CandidateSet {
   const started =
     typeof performance !== 'undefined' && typeof performance.now === 'function'
@@ -229,6 +289,7 @@ export function solveTopRoutes(
   const m = targets.length;
   const sorted = Array.from(targets).sort((a, b) => a - b);
   const edge = (a: number, b: number): number => flat[a * dim + b]!;
+  const localPre = toLocalPreMasks(preByPose, sorted);
 
   // 无目标：只剩 origin -> home 一条路线。
   if (m === 0) {
@@ -238,6 +299,7 @@ export function solveTopRoutes(
       ],
       targetCount: 0,
       solveMs: elapsedMs(started),
+      feasible: true,
     };
   }
   if (m > 20) {
@@ -282,6 +344,8 @@ export function solveTopRoutes(
       while (members !== 0) {
         const j = countTrailingZeros(members);
         members &= members - 1;
+        // “先于”门：j 的任一前置仍在待走集合 mask 中时，该后继流整体不参与合并。
+        if (localPre && (localPre[j]! & mask) !== 0) continue;
 
         const stepCost = flat[fromRow + sorted[j]!]!;
         const childBase = (mask ^ (1 << j)) * m + j;
@@ -323,6 +387,8 @@ export function solveTopRoutes(
   const ansI = new Int8Array(k);
   const ansR = new Int8Array(k);
   for (let i = 0; i < m; i++) {
+    // “先于”门：第一个姿态不得还有未访问（即仍在 full 中）的前置。
+    if (localPre && localPre[i]! !== 0) continue;
     const stepCost = edge(origin, sorted[i]!);
     const childBase = (full ^ (1 << i)) * m + i;
     for (let r = 0; r < k; r++) {
@@ -379,5 +445,10 @@ export function solveTopRoutes(
     candidates.push({ rank: rank + 1, sequence, tour, cost: total, targetCount: m });
   }
 
-  return { candidates, targetCount: m, solveMs: elapsedMs(started) };
+  return {
+    candidates,
+    targetCount: m,
+    solveMs: elapsedMs(started),
+    feasible: candidates.length > 0,
+  };
 }

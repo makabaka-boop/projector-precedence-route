@@ -1,5 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import { type CalibrationPlan, createDefaultPlan } from './solver/plan';
+import {
+  type CalibrationPlan,
+  createDefaultPlan,
+  prerequisiteMasks,
+} from './solver/plan';
 import { solveTopRoutes } from './solver/tsp';
 import { MatrixEditor } from './components/MatrixEditor';
 import { ExecutionConsole } from './components/ExecutionConsole';
@@ -24,9 +28,11 @@ export function App() {
     () => Array.from({ length: plan.n }, (_, k) => k + 1),
     [plan.n],
   );
+  // “先于”约束的位掩码；无依赖时为全 0，求解器走零成本原始路径。
+  const preByPose = useMemo(() => prerequisiteMasks(plan.prerequisites), [plan]);
   const candidateSet = useMemo(
-    () => solveTopRoutes(plan.matrixFlat, plan.n + 1, allTargets, 0, 0),
-    [plan, allTargets],
+    () => solveTopRoutes(plan.matrixFlat, plan.n + 1, allTargets, 0, 0, preByPose),
+    [plan, allTargets, preByPose],
   );
 
   // 新计划生效：选择回到候选首名（旧候选与旧选择一起作废）。
@@ -47,7 +53,8 @@ export function App() {
 
   const selected =
     candidateSet.candidates.find((c) => c.rank === selectedRank) ??
-    candidateSet.candidates[0]!;
+    candidateSet.candidates[0];
+  const feasible = candidateSet.feasible && selected !== undefined;
 
   return (
     <div className="app">
@@ -75,12 +82,15 @@ export function App() {
         </button>
         <button
           className={`tab ${tab === 'execute' ? 'active' : ''}`}
+          disabled={!feasible}
+          title={feasible ? undefined : '当前“先于”约束下没有可执行路线，请先在编辑台修正依赖'}
           onClick={() => {
+            if (!feasible) return;
             setPlanVersion((v) => v + 1);
             setTab('execute');
           }}
         >
-          2. 开始执行（当前选择：候选第 {selected.rank} 名）
+          2. 开始执行{feasible ? `（当前选择：候选第 ${selected.rank} 名）` : '（无可执行路线）'}
         </button>
       </nav>
 
@@ -89,7 +99,7 @@ export function App() {
           <CandidatePicker
             plan={plan}
             candidateSet={candidateSet}
-            selectedRank={selected.rank}
+            selectedRank={selectedRank}
             onSelect={setSelectedRank}
           />
 
@@ -97,7 +107,7 @@ export function App() {
         </>
       )}
 
-      {tab === 'execute' && (
+      {tab === 'execute' && feasible && (
         <ExecutionConsole
           key={planVersion}
           plan={plan}

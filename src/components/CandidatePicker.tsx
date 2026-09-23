@@ -15,6 +15,9 @@ interface CandidatePickerProps {
  * 校准路线候选集：一次给出按总耗时升序、同费按完整姿态序列字典序升序排列的
  * 前三条互异精确路线（不足三条时只有实际数量）。默认选择首名，工程师可改选，
  * 所选路线将作为执行台的原计划及增量基线。
+ *
+ * 当计划带“先于”约束时，候选只在满足约束的可行路线集合内排名；约束导致
+ * 无可行路线（理论上计划层已拦环，此处为防御展示）时就地说明、不提供选择。
  */
 export function CandidatePicker({
   plan,
@@ -24,6 +27,19 @@ export function CandidatePicker({
 }: CandidatePickerProps) {
   const dim = plan.n + 1;
   const edgeAt = (a: number, b: number) => plan.matrixFlat[a * dim + b]!;
+  const prereqs = plan.prerequisites ?? [];
+
+  if (!candidateSet.feasible || candidateSet.candidates.length === 0) {
+    return (
+      <div className="panel">
+        <h2>校准路线候选集</h2>
+        <div className="alert error" role="alert">
+          当前“先于”约束下不存在满足全部前置条件的可执行路线；请删除相互约束（环）后重新应用。
+          已应用的上一份有效计划未被修改。
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="panel">
@@ -34,6 +50,13 @@ export function CandidatePicker({
         默认选择首名，可改选后点上方“开始执行”进入执行台。求解耗时
         {candidateSet.solveMs.toFixed(1)} ms。
       </div>
+      {prereqs.length > 0 && (
+        <div className="alert info" role="status" data-testid="prereq-banner">
+          已生效“先于”约束（{prereqs.length} 条，规划器只在前置姿态已访问时扩展）：
+          {' '}
+          {prereqs.map(([a, b]) => `${a} 先于 ${b}`).join('；')}
+        </div>
+      )}
 
       <div className="candidate-list">
         {candidateSet.candidates.map((c) => {

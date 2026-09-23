@@ -5,7 +5,10 @@
  * - 姿态编号 1..N（N 取 8—18），0 为停放位。
  * - 费用矩阵为 (N+1)×(N+1) 的方阵，行优先二维数组。
  * - 主对角线必须为 0；其余项必须是 1..9999 的整数（费用有方向性，矩阵不必对称）。
- * - 任一缺项、越界或形状不符，整批拒绝（调用方保留旧计划）。
+ * - 可选“先于”关系 prerequisites：[a, b] 表示姿态 a 必须先于姿态 b 被确认；
+ *   提交前校验姿态存在、不可自指、依赖图无环；重复边去重。缺省即无约束，
+ *   旧输入行为逐项不变。
+ * - 任一缺项、越界、形状不符或非法依赖，整批拒绝（调用方保留旧计划）。
  */
 
 export const N_MIN = 8;
@@ -13,11 +16,19 @@ export const N_MAX = 18;
 export const COST_MIN = 1;
 export const COST_MAX = 9999;
 
+/** “先于”关系：[a, b] 表示姿态 a 必须先于姿态 b（a 是 b 的前置/基准姿态）。 */
+export type Precedence = [number, number];
+
 export interface CalibrationPlan {
   /** 姿态数量（姿态编号 1..n） */
   n: number;
   /** (n+1)² 个费用，行优先；matrix[i][j] = matrixFlat[i*(n+1)+j] */
   matrixFlat: number[];
+  /**
+   * 可选“先于”关系（已校验：姿态存在、不自指、无环，并按 (a,b) 升序去重）。
+   * 缺省或空数组 = 无任何前置约束，求解/执行/展示与旧版完全一致。
+   */
+  prerequisites?: Precedence[];
 }
 
 export interface ValidationResult {
@@ -32,12 +43,15 @@ export interface ValidationResult {
  * 校验工程师编辑或导入的 JSON。
  * 接受形如 { "n": 10, "matrix": [[0, ...], ...] } 或 { "n": 10, "costs": [[...]] } 的对象，
  * 也接受裸二维数组（此时 n = 边长 - 1）。
+ * 可选字段 "prerequisites"（也接受别名 "dependencies"）：形如 [[1, 3], [2, 3]]，
+ * 每条 [a, b] 表示姿态 a 必须先于姿态 b；逐条校验姿态存在、不可自指，整批校验无环。
  */
 export function validatePlan(input: unknown): ValidationResult {
   const errors: string[] = [];
 
   let matrix: unknown;
   let nCandidate: unknown;
+  let prereqRaw: unknown;
 
   if (Array.isArray(input)) {
     matrix = input;
@@ -46,6 +60,10 @@ export function validatePlan(input: unknown): ValidationResult {
     matrix =
       (input as Record<string, unknown>).matrix ??
       (input as Record<string, unknown>).costs;
+    prereqRaw = (input as Record<string, unknown>).prerequisites;
+    if (prereqRaw === undefined) {
+      prereqRaw = (input as Record<string, unknown>).dependencies;
+    }
   } else {
     return { ok: false, errors: ['JSON 顶层必须是对象（含 n 与 matrix）或二维数组'] };
   }
@@ -109,6 +127,18 @@ export function validatePlan(input: unknown): ValidationResult {
   if (!rowCountValid || !shapeValid || !Number.isInteger(n) || n < N_MIN || n > N_MAX) {
     return { ok: false, errors: dedupe(errors) };
   }
+
+  // “先于”关系校验（N 与矩阵形状已确认，姿态存在性即可逐对检查）。
+  let prerequisites: Precedence[] | undefined;
+  if (prereqRaw !== undefined) {
+    const prereqResult = validatePrecedences(prereqRaw, n);
+    if (prereqResult.errors.length > 0) {
+      errors.push(...prereqResult.errors);
+    } else {
+      prerequisites = prereqResult.edges;
+    }
+  }
+
   // 逐项检查（形状已确认：恰好 dim 行 × dim 列）
   const flat: number[] = [];
   for (let i = 0; i < dim; i++) {
@@ -140,7 +170,130 @@ export function validatePlan(input: unknown): ValidationResult {
     return { ok: false, errors: dedupe(errors) };
   }
 
-  return { ok: true, plan: { n, matrixFlat: flat }, errors: [] };
+  const plan: CalibrationPlan = { n, matrixFlat: flat };
+  if (prerequisites && prerequisites.length > 0) plan.prerequisites = prerequisites;
+  return { ok: true, plan, errors: [] };
+}
+
+interface PrecedenceResult {
+  /** 校验通过后按 (a, b) 升序去重的“先于”边 */
+  edges: Precedence[];
+  errors: string[];
+}
+
+/**
+ * 校验“先于”关系：必须是 [a, b] 二元整数数组；a、b 必须是 1..n 的现有姿态；
+ * 不可自指；重复边去重；整图必须无环（环上的姿态永远无法满足前置）。
+ */
+export function validatePrecedences(raw: unknown, n: number): PrecedenceResult {
+  const errors: string[] = [];
+  if (!Array.isArray(raw)) {
+    return {
+      edges: [],
+      errors: [`prerequisites 必须是形如 [[a, b], ...] 的数组（a 先于 b），收到：${formatValue(raw)}`],
+    };
+  }
+
+  const seen = new Set<number>();
+  const edges: Precedence[] = [];
+  const adjacency: number[][] = Array.from({ length: n + 1 }, () => []);
+
+  raw.forEach((entry, idx) => {
+    const badEntry = (msg: string): void => {
+      errors.push(`prerequisites[${idx}] ${msg}`);
+    };
+    if (!Array.isArray(entry) || entry.length !== 2) {
+      badEntry(`必须是恰好两个姿态编号的数组 [a, b]（a 先于 b），收到：${formatValue(entry)}`);
+      return;
+    }
+    const [a, b] = entry as unknown[];
+    const validA = typeof a === 'number' && Number.isInteger(a) && a >= 1 && a <= n;
+    const validB = typeof b === 'number' && Number.isInteger(b) && b >= 1 && b <= n;
+    if (!validA) {
+      badEntry(`的前置姿态 a 必须是 1—${n} 的现有姿态编号，收到：${formatValue(a)}`);
+    }
+    if (!validB) {
+      badEntry(`的后置姿态 b 必须是 1—${n} 的现有姿态编号，收到：${formatValue(b)}`);
+    }
+    if (!validA || !validB) return;
+    const av = a as number;
+    const bv = b as number;
+    if (av === bv) {
+      badEntry(`不可自指：姿态 ${av} 不能先于自己`);
+      return;
+    }
+    const key = av * (n + 1) + bv;
+    if (seen.has(key)) {
+      return; // 重复边静默去重（不报错）
+    }
+    seen.add(key);
+    edges.push([av, bv]);
+    adjacency[av]!.push(bv);
+  });
+
+  if (edges.length > 0) {
+    const cycle = findCycle(adjacency, n);
+    if (cycle) {
+      errors.push(
+        `“先于”依赖图存在环：${cycle.join(' → ')}（环上姿态的前置条件互相依赖，永远无法全部满足）`,
+      );
+    }
+  }
+
+  if (errors.length > 0) return { edges: [], errors: dedupe(errors) };
+  edges.sort((p, q) => p[0]! - q[0]! || p[1]! - q[1]!);
+  return { edges, errors: [] };
+}
+
+/**
+ * 有向图找环（DFS 三色法）：边 a→b 表示“a 必须先于 b”。
+ * 返回环上姿态（首尾相接展示），无环返回 null。n ≤ 18，递归深度安全。
+ */
+function findCycle(adjacency: number[][], n: number): number[] | null {
+  // 0 = 未访问，1 = 在当前递归栈中，2 = 已结束
+  const color = new Uint8Array(n + 1);
+  const stack: number[] = [];
+
+  const dfs = (u: number): number[] | null => {
+    color[u] = 1;
+    stack.push(u);
+    for (const v of adjacency[u]!) {
+      if (color[v] === 0) {
+        const found = dfs(v);
+        if (found) return found;
+      } else if (color[v] === 1) {
+        const start = stack.indexOf(v);
+        return [...stack.slice(start), v];
+      }
+    }
+    stack.pop();
+    color[u] = 2;
+    return null;
+  };
+
+  for (let u = 1; u <= n; u++) {
+    if (color[u] === 0) {
+      const found = dfs(u);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/**
+ * 把“先于”边转成求解器/执行机使用的前置位掩码：
+ * 返回数组按下标 = 姿态编号（0 号位闲置），preByPose[b] 的第 a 位为 1
+ * 表示姿态 a 必须先于姿态 b。
+ */
+export function prerequisiteMasks(prerequisites: ReadonlyArray<Precedence> | undefined): Uint32Array {
+  // 长度取 19：姿态编号 1..18，0 号位闲置；调用方按下标取位，无需知道 n。
+  const masks = new Uint32Array(N_MAX + 1);
+  if (prerequisites) {
+    for (const [a, b] of prerequisites) {
+      masks[b]! |= 1 << a;
+    }
+  }
+  return masks;
 }
 
 /** 生成默认合法计划：对角线 0，非对角默认 1（工程师可改出方向性）。 */

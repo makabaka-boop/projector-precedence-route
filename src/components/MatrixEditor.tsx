@@ -5,6 +5,7 @@ import {
   N_MAX,
   N_MIN,
   type CalibrationPlan,
+  type Precedence,
   validatePlan,
 } from '../solver/plan';
 
@@ -22,6 +23,11 @@ interface MatrixEditorProps {
 export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
   const [n, setN] = useState<number>(plan.n);
   const [cells, setCells] = useState<number[]>(plan.matrixFlat);
+  // “先于”关系草稿：与已生效计划分离，只有“校验并应用”通过才随计划一起生效。
+  const [prereqs, setPrereqs] = useState<Precedence[]>(plan.prerequisites ?? []);
+  // 下一条待加入关系的两个端点（草稿中的草稿，未点“添加”不进列表）。
+  const [draftA, setDraftA] = useState<number>(1);
+  const [draftB, setB] = useState<number>(2);
   const [errors, setErrors] = useState<string[]>([]);
   const [notice, setNotice] = useState<string>('');
   const [jsonText, setJsonText] = useState<string>('');
@@ -48,6 +54,12 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
     }
     setN(nextN);
     setCells(next);
+    // “先于”草稿同步裁掉引用已删除姿态的边；待加入的端点也收回范围。
+    setPrereqs((prev) =>
+      prev.filter(([a, b]) => a <= nextN && b <= nextN),
+    );
+    setDraftA((a) => Math.min(a, nextN));
+    setB((b) => Math.min(Math.max(b, 2), nextN));
     setErrors([]);
     setNotice('');
   }
@@ -75,17 +87,54 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
     return !Number.isInteger(v) || v < COST_MIN || v > COST_MAX;
   }
 
+  /**
+   * 加入一条“先于”草稿 [a, b]：仅改草稿（自指/重复/越界就地提示，不触碰已生效计划）；
+   * 环与提交时的整批校验一起在 commit 里完成。
+   */
+  function addPrereq(a: number, b: number) {
+    if (!Number.isInteger(a) || !Number.isInteger(b) || a < 1 || a > n || b < 1 || b > n) {
+      setErrors([`“先于”姿态必须是 1—${n} 的现有姿态编号`]);
+      setNotice('');
+      return;
+    }
+    if (a === b) {
+      setErrors([`不可自指：姿态 ${a} 不能先于自己（未加入依赖草稿）`]);
+      setNotice('');
+      return;
+    }
+    if (prereqs.some(([pa, pb]) => pa === a && pb === b)) {
+      setNotice(`依赖 ${a} 先于 ${b} 已在草稿中，重复添加被忽略。`);
+      return;
+    }
+    const next = [...prereqs, [a, b] as Precedence].sort(
+      (p, q) => p[0] - q[0] || p[1] - q[1],
+    );
+    setPrereqs(next);
+    setErrors([]);
+    setNotice(`已加入草稿依赖：姿态 ${a} 必须先于姿态 ${b}。点击“校验并应用”后才会生效。`);
+  }
+
+  function removePrereq(a: number, b: number) {
+    setPrereqs(prereqs.filter(([pa, pb]) => pa !== a || pb !== b));
+    setErrors([]);
+    setNotice('');
+  }
+
   function commit() {
     const nested: number[][] = [];
     for (let i = 0; i < dim; i++) nested.push(cells.slice(i * dim, (i + 1) * dim));
-    const result = validatePlan({ n, matrix: nested });
+    const result = validatePlan({ n, matrix: nested, prerequisites: prereqs });
     if (!result.ok || !result.plan) {
-      setErrors(result.errors);
+      setErrors([...result.errors, '整批拒绝：当前已生效计划（含其依赖）保持不变。']);
       setNotice('');
       return;
     }
     setErrors([]);
-    setNotice(`计划已生效：N=${result.plan.n}，费用矩阵 (${dim}×${dim}) 全部合法。`);
+    setPrereqs(result.plan.prerequisites ?? []);
+    const depCount = result.plan.prerequisites?.length ?? 0;
+    setNotice(
+      `计划已生效：N=${result.plan.n}，费用矩阵 (${dim}×${dim}) 全部合法，“先于”约束 ${depCount} 条。`,
+    );
     onApply(result.plan);
   }
 
@@ -100,14 +149,17 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
     }
     const result = validatePlan(parsed);
     if (!result.ok || !result.plan) {
-      setErrors([...result.errors, '整批拒绝：当前已生效计划保持不变。']);
+      setErrors([...result.errors, '整批拒绝：当前已生效计划（含其依赖）保持不变。']);
       setNotice('');
       return;
     }
     setN(result.plan.n);
     setCells(result.plan.matrixFlat);
+    setPrereqs(result.plan.prerequisites ?? []);
     setErrors([]);
-    setNotice(`导入成功：N=${result.plan.n}。点击“校验并应用”后才会替换当前计划。`);
+    setNotice(
+      `导入成功：N=${result.plan.n}，“先于”约束 ${result.plan.prerequisites?.length ?? 0} 条。点击“校验并应用”后才会替换当前计划。`,
+    );
   }
 
   function importJson() {
@@ -136,17 +188,27 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
   function exportJson() {
     const nested: number[][] = [];
     for (let i = 0; i < dim; i++) nested.push(cells.slice(i * dim, (i + 1) * dim));
-    const text = JSON.stringify({ n, matrix: nested }, null, 2);
+    const payload: { n: number; matrix: number[][]; prerequisites?: [number, number][] } = {
+      n,
+      matrix: nested,
+    };
+    if (prereqs.length > 0) {
+      payload.prerequisites = prereqs.map(([a, b]) => [a, b]);
+    }
+    const text = JSON.stringify(payload, null, 2);
     setJsonText(text);
-    setNotice('已把当前网格序列化为 JSON（仍以已生效计划为准，除非再应用）。');
+    setNotice('已把当前网格与依赖草稿序列化为 JSON（仍以已生效计划为准，除非再应用）。');
   }
 
   const columnHeaders = useMemo(() => Array.from({ length: dim }, (_, k) => k), [dim]);
 
   useEffect(() => {
-    // 外部（如“恢复默认”）更换计划时同步草稿
+    // 外部（如“恢复默认”）更换计划时同步草稿（费用网格与“先于”依赖一起）
     setN(plan.n);
     setCells(plan.matrixFlat);
+    setPrereqs(plan.prerequisites ?? []);
+    setDraftA(1);
+    setB(Math.min(2, plan.n));
   }, [plan]);
 
   const invalidCount = cells.filter((v, idx) => {
@@ -261,6 +323,89 @@ export function MatrixEditor({ plan, onApply }: MatrixEditorProps) {
             {notice}
           </div>
         )}
+      </div>
+
+      <div className="panel">
+        <h2>“先于”关系（可选基准姿态约束）</h2>
+        <div className="hint" style={{ marginBottom: 10 }}>
+          每条 [a, b] 表示姿态 <b>a 必须先于</b> 姿态 b：规划器只在 a 已访问后才把 b 纳入扩展，
+          执行台在 a 确认前会拒绝确认 b。此处只是<b>草稿</b>，与下方费用一起点“校验并应用”
+          通过后才生效；非法姿态、自指或依赖成环会被整批拒绝，<b>已应用计划与旧候选不被污染</b>。
+          无依赖的旧数据行为完全不变。
+        </div>
+
+        <div className="row prereq-add">
+          <label>
+            前置姿态
+            <select
+              aria-label="新增先于关系的前置姿态 a"
+              value={draftA}
+              onChange={(e) => setDraftA(Number(e.target.value))}
+            >
+              {Array.from({ length: n }, (_, k) => k + 1).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          </label>
+          <span className="muted">必须先于</span>
+          <label>
+            后置姿态
+            <select
+              aria-label="新增先于关系的后置姿态 b"
+              value={draftB}
+              onChange={(e) => setB(Number(e.target.value))}
+            >
+              {Array.from({ length: n }, (_, k) => k + 1).map((v) => (
+                <option key={v} value={v}>
+                  {v}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            className="btn"
+            aria-label="添加先于关系到草稿"
+            onClick={() => addPrereq(draftA, draftB)}
+          >
+            添加到草稿
+          </button>
+          {prereqs.length > 0 && (
+            <button type="button" className="btn" onClick={() => setPrereqs([])}>
+              清空草稿（不影响已生效计划）
+            </button>
+          )}
+        </div>
+
+        {prereqs.length === 0 ? (
+          <div className="muted" data-testid="prereq-empty">
+            当前草稿无“先于”约束：所有姿态可任意排序，路线即原始非对称 TSP 精确解。
+          </div>
+        ) : (
+          <ul className="prereq-list" data-testid="prereq-list">
+            {prereqs.map(([a, b]) => (
+              <li key={`${a}-${b}`} className="prereq-item">
+                <span>
+                  姿态 <b>{a}</b> 必须先于姿态 <b>{b}</b>
+                </span>
+                <button
+                  type="button"
+                  className="btn small"
+                  aria-label={`删除先于关系 ${a} 先于 ${b}`}
+                  onClick={() => removePrereq(a, b)}
+                >
+                  删除
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="hint">
+          已生效计划当前带 {(plan.prerequisites ?? []).length} 条约束；草稿 {prereqs.length} 条。
+          应用后候选路线与执行台立即在剩余姿态上遵守这些前置条件。
+        </div>
       </div>
 
       <div className="panel">

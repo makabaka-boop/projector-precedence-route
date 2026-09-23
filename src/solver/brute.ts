@@ -18,8 +18,12 @@ export function bruteForceOptimal(
   targetsIn: ArrayLike<number>,
   origin: number,
   home: number,
+  preByPose?: ArrayLike<number>,
 ): BruteResult {
-  const top = bruteForceTopK(flat, dim, targetsIn, origin, home, 1);
+  const top = bruteForceTopK(flat, dim, targetsIn, origin, home, 1, preByPose);
+  if (top.length === 0) {
+    throw new Error('前置约束下不存在可行路线（依赖可能成环）');
+  }
   return { sequence: top[0]!.sequence, cost: top[0]!.cost };
 }
 
@@ -33,6 +37,10 @@ export interface BruteCandidate {
  * origin -> 排列 -> home 的费用，返回按 （费用升序，同费按完整序列字典序升序）
  * 排列的前 k 名；互异排列总数不足 k 时只返回实际数量。
  *
+ * 可选 preByPose（按姿态编号取位：preByPose[b] 的第 a 位为 1 表示 a 先于 b）：
+ * 回溯只在候选姿态的全部前置都已位于当前排列（或不在目标集，视为已满足）时才扩展，
+ * 即枚举的每个叶节点都是满足“先于”关系的拓扑序；约束下无可行路线时返回空数组。
+ *
  * 每一次访问末端都拿完整费用与当前榜做有序插入；同一排列只出现一次，天然互异。
  */
 export function bruteForceTopK(
@@ -42,12 +50,25 @@ export function bruteForceTopK(
   origin: number,
   home: number,
   k: number,
+  preByPose?: ArrayLike<number>,
 ): BruteCandidate[] {
   const targets = Array.from(targetsIn).sort((a, b) => a - b);
   const edge = (a: number, b: number) => flat[a * dim + b]!;
 
   if (targets.length === 0) {
     return [{ sequence: [], cost: edge(origin, home) }];
+  }
+
+  // 全局前置位 → targets 本地位：前置不在目标集中（执行中已完成）时自动忽略。
+  let localPre: Uint32Array | undefined;
+  if (preByPose) {
+    localPre = new Uint32Array(targets.length);
+    for (let j = 0; j < targets.length; j++) {
+      const global = preByPose[targets[j]!] ?? 0;
+      for (let p = 0; p < targets.length; p++) {
+        if ((global & (1 << targets[p]!)) !== 0) localPre[j]! |= 1 << p;
+      }
+    }
   }
 
   const top: BruteCandidate[] = [];
@@ -66,22 +87,31 @@ export function bruteForceTopK(
     if (top.length < k) top.push({ sequence: seq.slice(), cost: total });
   };
 
-  const visit = (perm: number[], used: boolean[], cost: number, last: number) => {
+  // visitedMask 记录当前排列中已用的本地位；候选 i 可扩展当且仅当它尚未使用
+  // 且它的所有前置都已位于排列中（不在目标集的前置自动视为满足）。
+  const visit = (
+    perm: number[],
+    used: boolean[],
+    cost: number,
+    last: number,
+    visitedMask: number,
+  ) => {
     if (perm.length === targets.length) {
       offer(perm, cost + edge(last, home));
       return;
     }
     for (let i = 0; i < targets.length; i++) {
       if (used[i]) continue;
+      if (localPre && (localPre[i]! & ~visitedMask) !== 0) continue;
       used[i] = true;
       perm.push(targets[i]!);
-      visit(perm, used, cost + edge(last, targets[i]!), targets[i]!);
+      visit(perm, used, cost + edge(last, targets[i]!), targets[i]!, visitedMask | (1 << i));
       perm.pop();
       used[i] = false;
     }
   };
 
-  visit([], new Array(targets.length).fill(false), 0, origin);
+  visit([], new Array(targets.length).fill(false), 0, origin, 0);
   return top;
 }
 
